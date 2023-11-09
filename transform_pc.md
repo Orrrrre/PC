@@ -135,12 +135,12 @@ def farthest_point_sample(xyz, npoint):
         centroids[:, i] = farthest  # (b, npoint)
         centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)  # (B, 3) -> (B, 1, 3)
         dist = torch.sum((xyz - centroid) ** 2, -1)  # (B, N, 3) - (B, 1, 3) -> dist(B, N):选出来的点与所有点的最小二乘(包含的是当前点与所有点的距离)
-        mask = dist < distance  # 你与上一个最远点的距离肯定是大于当前计算的所有的dist，因此上一个最远点处会被标为false，避免选点来回在两个最远点之间跳摆。
+        mask = dist < distance  # 你与上一个最远点的距离肯定是大于当前计算的所有的dist，因此上一个最远点处会被标为false，避免选点来回在两个最远点之间跳摆。看下方示例👇
         distance[mask] = dist[mask]  # 更新distance为排除所选最远点之后的值
-        farthest = torch.max(distance, -1)[1]
+        farthest = torch.max(distance, -1)[1]  # 取[1]是因为返回结果元组中的第二项是idx
     return centroids
 #  当B=4， N=5, npoint=3时的结果
->>
+>>👇
 farthest0:                                  farthest1:
 tensor([0, 3, 4, 2])                        tensor([1, 0, 1, 0])
 dist:                                       dist:
@@ -199,6 +199,36 @@ tensor([[   0,    0,    0, 1856, 4358],
 一个`set abstraction`代码如下：
 
 ```python
+def square_distance(src, dst):  # new_xyz(centroieds)[B, S, C]  xyz[B, N, C]
+    """
+    Calculate Euclid distance between each two points.
+
+    src^T * dst = xn * xm + yn * ym + zn * zm;
+    sum(src^2, dim=-1) = xn*xn + yn*yn + zn*zn;
+    sum(dst^2, dim=-1) = xm*xm + ym*ym + zm*zm;
+    dist = (xn - xm)^2 + (yn - ym)^2 + (zn - zm)^2
+         = sum(src**2,dim=-1)+sum(dst**2,dim=-1)-2*src^T*dst
+
+    Input:
+        src: source points, [B, N, C]
+        dst: target points, [B, M, C]
+    Output:
+        dist: per-point square distance, [B, N, M]
+    """
+    B, N, _ = src.shape
+    _, M, _ = dst.shape
+
+    #  (src-dst)**2
+    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))  # -2src*dst  (B, S, C)MM(B, C, N)->(B, S, N)
+    dist += torch.sum(src ** 2, -1).view(B, M, 1)  # src**2  (B, S)->(B, S, 1) + (B, S, N)
+    dist += torch.sum(dst ** 2, -1).view(B, 1, N)  # dst**2  (B, N)->(B, 1, N) + (B, S, N)
+    return dist  # (B, S, N)
+>>             
+  ——————>     S1 S2     dist*(-2)       P^2[3, 1]    S^2[1, 2]        final_dist[B, 3, 2]
+  P1@ @ @      * *|      @* @*              (Σ@^2)                   (@*+Σ@^2+Σ*^2, @*+Σ@^2+Σ*^2)
+  P2@ @ @  MM  * *|  ->  @* @*  *(-2)  -> + (Σ@^2)  + (Σ*^2, Σ*^2) ->(@*+Σ@^2+Σ*^2, @*+Σ@^2+Σ*^2)
+  P3@ @ @      * *↓      @* @*              (Σ@^2)                   (@*+Σ@^2+Σ*^2, @*+Σ@^2+Σ*^2)
+
 def query_ball_point(radius, nsample, xyz, new_xyz):
     """
     Input:
@@ -212,18 +242,26 @@ def query_ball_point(radius, nsample, xyz, new_xyz):
     device = xyz.device
     B, N, C = xyz.shape
     _, S, _ = new_xyz.shape
-    group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
-    sqrdists = square_distance(new_xyz, xyz)
-    group_idx[sqrdists > radius ** 2] = N
-    group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
+    # group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
+
+    sqrdists = square_distance(new_xyz, xyz)  # (B, S, N)每个采样中心到各个点的欧式距离的平方
+
+    # (B, S, N) group_idx其中的值为0~N-1
+    sort_dis, group_idx = sqrdists.sort(dim=-1)  # group_idx(B, S, N)升序排序后的group_idx
+    group_idx[sort_dis > radius ** 2] = N  # 索引的范围为0~N-1，所以N是不存在的，因此可将超出范围的idx置为N
+    group_idx = group_idx[:, :, :nsample]  # (B, S, nsample)其中最后几个idx有可能是N(group中点不足)
+
+    # 👇当group中的点不足nsample个时，使用离采样中心最近的点来填充
+    # 构建一个由当前batch中距离每一个样本中心最近的点(first point)填充的矩阵(B, S, nsample)
     group_first = group_idx[:, :, 0].view(B, S, 1).repeat([1, 1, nsample])
+    # 从排序且筛选nsample项的groupe_idx中找出所有idx为N的点
     mask = group_idx == N
-    group_idx[mask] = group_first[mask]
+    # 将排序且筛选nsample项的groupe_idx中的idx为N的点替换为first point的idx
+    group_idx[mask] = group_first[mask]  
     return group_idx
 
 def index_points(points, idx):
     """
-
     Input:
         points: input points data, [B, N, C]
         idx: sample index data, [B, S]
@@ -232,13 +270,42 @@ def index_points(points, idx):
     """
     device = points.device
     B = points.shape[0]
-    view_shape = list(idx.shape)
+    view_shape = list(idx.shape)  # [B, S]
     view_shape[1:] = [1] * (len(view_shape) - 1)
-    repeat_shape = list(idx.shape)
-    repeat_shape[0] = 1
+    repeat_shape = list(idx.shape)  # [B, S]
+    repeat_shape[0] = 1  # [1, S]
     batch_indices = torch.arange(B, dtype=torch.long).to(device).view(view_shape).repeat(repeat_shape)
     new_points = points[batch_indices, idx, :]
     return new_points
+>>  # 解释一下batch_indices中的view和repeat：
+以下面的为例：
+    a = torch.randint(0, 8, (3, 3, 4))  # 表示原点集B=3, N=3, C=4
+    idx2 = torch.tensor([[0, 1], [1, 2], [0, 2]])  # 表示farthest采样出来的centroieds的idx,形状为(B, S)在这个例子中S=2
+    idx = torch.arange(3).view((3, 1)).repeat(1, 2)  # 表示将idx:[0, 1, ..., B-1]view与repeat后idx的形状为(B, S),目的是与第二维度索引形状相同，这样才能对应位置索引到点集。
+
+a:                        idx：           
+tensor([[[2, 7, 3, 6],    tensor([[0, 0],                 
+         [6, 4, 4, 4],            [1, 1],                 
+         [1, 6, 0, 2]],           [2, 2]])                  
+                          idx[2]:        
+        [[7, 2, 6, 2],    tensor([[0, 1],                 
+         [0, 1, 6, 1],            [1, 2],                 
+         [1, 5, 3, 6]],           [0, 2]])                   
+                                    
+        [[3, 1, 4, 0],                    
+         [0, 0, 7, 3],                                    
+         [0, 3, 7, 3]]])                  
+                                                       
+                                    
+a[idx, idx2, :]:  # (B, S, C)                                         
+tensor([[[2, 7, 3, 6],                                     
+         [6, 4, 4, 4]],                            
+                                    
+        [[0, 1, 6, 1],                    
+         [1, 5, 3, 6]],                                    
+                                                  
+        [[3, 1, 4, 0],
+         [0, 3, 7, 3]]])
 
 def sample_and_group(npoint, radius, nsample, xyz, points, returnfps=False):
     """
@@ -255,7 +322,7 @@ def sample_and_group(npoint, radius, nsample, xyz, points, returnfps=False):
     B, N, C = xyz.shape
     S = npoint
     fps_idx = farthest_point_sample(xyz, npoint) # [B, npoint, C]
-    new_xyz = index_points(xyz, fps_idx)
+    new_xyz = index_points(xyz, fps_idx)  # [B, S, C]
     idx = query_ball_point(radius, nsample, xyz, new_xyz)
     grouped_xyz = index_points(xyz, idx) # [B, npoint, nsample, C]
     grouped_xyz_norm = grouped_xyz - new_xyz.view(B, S, 1, C)
