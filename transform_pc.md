@@ -229,7 +229,7 @@ def square_distance(src, dst):  # new_xyz(centroieds)[B, S, C]  xyz[B, N, C]
   P2@ @ @  MM  * *|  ->  @* @*  *(-2)  -> + (Σ@^2)  + (Σ*^2, Σ*^2) ->(@*+Σ@^2+Σ*^2, @*+Σ@^2+Σ*^2)
   P3@ @ @      * *↓      @* @*              (Σ@^2)                   (@*+Σ@^2+Σ*^2, @*+Σ@^2+Σ*^2)
 
-def query_ball_point(radius, nsample, xyz, new_xyz):
+def query_ball_point(radius, nsample, xyz, new_xyz):#  这里官方源代码中有误，做了一些更改
     """
     Input:
         radius: local region radius
