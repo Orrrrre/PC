@@ -347,7 +347,7 @@ class PointNetSetAbstraction(nn.Module):
         self.mlp_bns = nn.ModuleList()
         last_channel = in_channel
         for out_channel in mlp:
-            self.mlp_convs.append(nn.Conv2d(last_channel, out_channel, 1))
+            self.mlp_convs.append(nn.Conv2d(last_channel, out_channel, 1))  # 虽然Conv2d，但是1* 1的卷积😵
             self.mlp_bns.append(nn.BatchNorm2d(out_channel))
             last_channel = out_channel
         self.group_all = group_all
@@ -385,3 +385,145 @@ class PointNetSetAbstraction(nn.Module):
 >  
 > `It is common that a point set comes with` **nonuniform density** `in` **different areas**  
 > `Features learned in` **dense** `data may` **not generalize to** **sparsely** `sampled regions`
+
+于是作者提出了**两种特征融合方式**，分别为：
+
+1. Multi-scale grouping (MSG):是对不同半径的子区域进行特征提取后进行特征堆叠,MSG方法计算量太大，提出来的备选方案MRG
+2. Multiresolution grouping (MRG):MRG用两个Pointnet对连续的两层分别做特征提取与聚合，然后再进行特征拼接。
+
+![msg& mrg](pics/MSG&%20MRG.jpg "")
+
+MSG:
+
+```python
+  B, N, C = xyz.shape
+  S = self.npoint
+  new_xyz = index_points(xyz, farthest_point_sample(xyz, S))
+  new_points_list = []
+  for i, radius in enumerate(self.radius_list):
+      K = self.nsample_list[i]
+      group_idx = query_ball_point(radius, K, xyz, new_xyz)
+      grouped_xyz = index_points(xyz, group_idx)
+      grouped_xyz -= new_xyz.view(B, S, 1, C)
+      if points is not None:
+          grouped_points = index_points(points, group_idx)
+          grouped_points = torch.cat([grouped_points, grouped_xyz], dim=-1)
+      else:
+          grouped_points = grouped_xyz
+
+      grouped_points = grouped_points.permute(0, 3, 2, 1)  # [B, D, K, S]
+      for j in range(len(self.conv_blocks[i])):
+          conv = self.conv_blocks[i][j]
+          bn = self.bn_blocks[i][j]
+          grouped_points =  F.relu(bn(conv(grouped_points)))
+      new_points = torch.max(grouped_points, 2)[0]  # [B, D', S]
+      new_points_list.append(new_points)
+
+  new_xyz = new_xyz.permute(0, 2, 1)
+  new_points_concat = torch.cat(new_points_list, dim=1)
+```
+
+## VoxelNet
+
+来自[知乎](https://zhuanlan.zhihu.com/p/352419316)
+
+### 特征学习网络
+
+1. **Voxel Partition**：也就是将空间划分为一个个堆叠的、相同大小的Voxel
+2. **Grouping**：上面将空间划分为一个个的Voxel了，Grouping这一步的作用就是将3D**点云数据装进这一个个的Voxel中**，实现分组。
+3. **Random Sampling**：3D点云的数据量往往都是10万以上的。要是直接在这个数量级上进行特征提取，是非常消耗计算资源的，而且可能会引发检测偏差（bias the detection）。所以作者提出了随机采样方法，将**点云数量超过`T`的Voxel**中的点云数量降至`T`。
+4. **Stacked Voxel Feature Encoding**：这一步是最重要的一步。作者在这一步提出了VFE层（VFE= Voxel Feature Encoding）。我相信作者提出这个层，应该是受到了PointNet的启发。这里我们给出这个层的实现图
+![VFE](./pics/VFE.jpg "VFE")  
+    1. 上图中Voxel有**3个**点云数据。作者先用一个FCN层(**逐点计算**，并没有引入点与点之间的关系，也就是local feature，所以FCN指的是全连接层)
+    作者在此基础上引入**Element-wise maxpool**，获得**Locally Aggregated Feature**。Locally Aggregated Feature反应了这些点的一个局部关系。(对应上图中第二个白框)  
+    2. 作者将Point-wise Feature和Locally Aggregated Feature进行了简单的堆叠融合，作为下一个VFE层的输入。
+    这样连续堆叠几次VFE层后，就获得更丰富的特征表示。最后，使用一个Element-wise maxpool**获得最后的一个Voxel-wise Feature**.
+    ![层叠VFE](./pics/层叠VFE.jpg)  
+    ![Voxel-wise_Feature](./pics/Voxel-wise_Feature.jpg)`->`![feature](./pics/feature.jpg)
+4中的代码实现：
+
+```python
+# Fully Connected Network
+class FCN(nn.Module):
+    def __init__(self, cin, cout):
+        super(FCN, self).__init__()
+        self.cout = cout
+        # 定义全连接层
+        self.linear = nn.Linear(cin, cout)
+        # 定义批量归一化层
+        self.bn = nn.BatchNorm1d(cout)
+
+    def forward(self, x):  # x(KK, t, C)
+        # 获取输入张量的形状
+        # KK is the stacked k across batch(每一个batch中包含了多少个voxel)
+        kk, t, _ = x.shape
+        # 将输入张量视图重塑为二维张量
+        x = self.linear(x.view(kk * t, -1))  # 当前batch中有kk* t个点，view成变成(kk*t， C)送入FCN
+        # 对全连接层的输出进行批量归一化和ReLU激活
+        x = F.relu(self.bn(x))
+        # 将输出张量再次重塑为三维张量
+        return x.view(kk, t, -1)
+
+# Voxel Feature Encoding layer
+class VFE(nn.Module):
+
+    def __init__(self, cin, cout):
+        super(VFE, self).__init__()
+        assert cout % 2 == 0
+        self.units = cout // 2
+        self.fcn = FCN(cin, self.units)
+
+    def forward(self, x, mask):  # x(KK, t, C) 其中：mask = torch.ne(torch.max(x,2)[0], 0)在SVFE中有定义
+        # 那么mask的形状为(KK, T)，用于筛选掉voxel中不包含点的位置(batch中有KK个voxel，其中voxel不包含点的位置在dim=2中一定全为0，最大值一定为0)
+        # point-wise feauture
+        pwf = self.fcn(x)  # (KK, t, C)
+        #locally aggregated feature
+        laf = torch.max(pwf, 1)[0].unsqueeze(1).repeat(1, cfg.T, 1)  # (KK, t, C)->(KK, 1, C)->(KK, T, C)
+        # point-wise concat feature
+        pwcf = torch.cat((pwf, laf),dim=2)  # concat(KK, t, cout//2)(KK, T, cout//2)->(KK, T, cout)
+        # apply mask
+        mask = mask.unsqueeze(2).repeat(1, 1, self.units * 2)  # (KK, T)->(KK, T, 1)->(KK, T, cout)
+        pwcf = pwcf * mask.float()  # (KK, T, cout)* (KK, T, cout) -> (KK, T, cout)
+
+        return pwcf  # (KK, T, cout)
+
+# Stacked Voxel Feature Encoding
+class SVFE(nn.Module):
+
+    def __init__(self):
+        super(SVFE, self).__init__()
+        self.vfe_1 = VFE(7,32)
+        self.vfe_2 = VFE(32,128)
+        self.fcn = FCN(128,128)
+    def forward(self, x):  # (KK, T, 7)
+        mask = torch.ne(torch.max(x,2)[0], 0)
+        x = self.vfe_1(x, mask)  # (KK, T, 32)
+        x = self.vfe_2(x, mask)  # (KK, T, 128)
+        x = self.fcn(x)  # (KK, T, 128)
+        # element-wise max pooling
+        x = torch.max(x,1)[0]  # (KK, 1, 128)->(KK, 128)
+        return x  # (KK, 128)
+```
+
+### 卷积层Convolutional Middle Layer(CML)
+
+> 在所有Voxel中做3d卷积，进一步扩大感受野，增加更多的信息描述。
+
+点云数据通过特征学习网络后可以被表示成一个**稀疏的4D张量**, 维度记做(C, D(epth), H(eight), W(idth))  
+其中`C`为Voxel-wise Feature的向量维度(即SVFE得到的`128`维特征), `D, H, W`分别为空间的深度、高度和宽度（**单位为Voxel数量**）  
+
+```python
+# Convolutional Middle Layer
+class CML(nn.Module):
+    def __init__(self):
+        super(CML, self).__init__()
+        self.conv3d_1 = Conv3d(128, 64, 3, s=(2, 1, 1), p=(1, 1, 1))  # (128, D, H, W)->(64, D/2, H, W)
+        self.conv3d_2 = Conv3d(64, 64, 3, s=(1, 1, 1), p=(0, 1, 1))  # (64, D/2 - 2, H, W)
+        self.conv3d_3 = Conv3d(64, 64, 3, s=(2, 1, 1), p=(1, 1, 1))  # (64, D/4 - 1, H, W)
+
+    def forward(self, x):  # 输入x的形状为(C, D, H, W)
+        x = self.conv3d_1(x)
+        x = self.conv3d_2(x)
+        x = self.conv3d_3(x)
+        return x  # (64, D/4 - 1, H, W)
+```
