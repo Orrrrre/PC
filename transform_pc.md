@@ -439,7 +439,7 @@ MSG:
     2. 作者将Point-wise Feature和Locally Aggregated Feature进行了简单的堆叠融合，作为下一个VFE层的输入。
     这样连续堆叠几次VFE层后，就获得更丰富的特征表示。最后，使用一个Element-wise maxpool**获得最后的一个Voxel-wise Feature**.
     ![层叠VFE](./pics/层叠VFE.jpg)  
-    ![Voxel-wise_Feature](./pics/Voxel-wise_Feature.jpg)`->`![feature](./pics/feature.jpg)
+    ![Voxel-wise_Feature](./pics/Voxel-wise_Feature.jpg)`->`![feature](./pics/feature.jpg)  
 4中的代码实现：
 
 ```python
