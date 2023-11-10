@@ -510,7 +510,7 @@ class SVFE(nn.Module):
 > 在所有Voxel中做3d卷积，进一步扩大感受野，增加更多的信息描述。
 
 点云数据通过特征学习网络后可以被表示成一个**稀疏的4D张量**, 维度记做(C, D(epth), H(eight), W(idth))  
-其中`C`为Voxel-wise Feature的向量维度(即SVFE得到的`128`维特征), `D, H, W`分别为空间的深度、高度和宽度（**单位为Voxel数量**）  
+其中`C`为Voxel-wise Feature的向量维度(即SVFE得到的`128`维特征), `D, H, W`分别为空间的深度、高度和宽度（**单位为Voxel**）  
 
 ```python
 # Convolutional Middle Layer
