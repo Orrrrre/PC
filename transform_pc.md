@@ -527,3 +527,89 @@ class CML(nn.Module):
         x = self.conv3d_3(x)
         return x  # (64, D/4 - 1, H, W)
 ```
+
+### RPN层(不同于Faster-RCNN中，这个的score map直接输出每个类比的分数)
+
+> RPN层有两个分支，一个用来输出**类别的概率分布**（通常叫做Score Map），一个用来输出Anchor到**真实框的变化过程**（通常叫做 Regression Map）。  
+>
+> 以中间卷积层的输出特征图为输入，分别经过**三次下采样**（每次stride=2）获得三个不同维度的特征图。作者将这个三个特征图**缩放至同一维度**后进行拼接，有点FPN（特征金字塔网络）的感觉。最后，拼接的特征被映射成两个输出特征图。
+
+代码如下：
+
+```python
+# Region Proposal Network
+class RPN(nn.Module):  # (N, C*D, H, W)
+    def __init__(self):
+        super(RPN, self).__init__()
+        # 一次下采样
+        self.block_1 = [Conv2d(128, 128, 3, 2, 1)]  # (N, C*D, H, W)
+        self.block_1 += [Conv2d(128, 128, 3, 1, 1) for _ in range(3)]
+        self.block_1 = nn.Sequential(*self.block_1)  # -> (N, C*D, H/2, W/2)
+        # 二次下采样
+        self.block_2 = [Conv2d(128, 128, 3, 2, 1)]  # (N, C*D, H/2, W/2)
+        self.block_2 += [Conv2d(128, 128, 3, 1, 1) for _ in range(5)]
+        self.block_2 = nn.Sequential(*self.block_2)  # -> (N, C*D, H/4, W/4)
+        # 三次下采样& 升维
+        self.block_3 = [Conv2d(128, 256, 3, 2, 1)]  # (N, C*D, H/4, W/4)
+        self.block_3 += [nn.Conv2d(256, 256, 3, 1, 1) for _ in range(5)]
+        self.block_3 = nn.Sequential(*self.block_3)  # -> (N, 2*C*D, H/8, W/8)
+
+        # 看到转置卷积就想想怎么设置卷积参数才能得到这个输入：如想上采样4倍，那么在卷积时必然下采样了4倍。
+        # 可选的一组参数k_size=4，p=0，s=4。
+        # (N, 2*D*C, H/8, W/8)->(N, 2*D*C, H/2, H/2)
+        self.deconv_1 = nn.Sequential(nn.ConvTranspose2d(256, 256, 4, 4, 0),nn.BatchNorm2d(256))
+        # (N, C*D, H/4, W/4)->(N, 2*D*C, H/2, H/2)
+        self.deconv_2 = nn.Sequential(nn.ConvTranspose2d(128, 256, 2, 2, 0),nn.BatchNorm2d(256))
+        # (N, C*D, H/2, W/2)->(N, 2*D*C, H/2, H/2)
+        self.deconv_3 = nn.Sequential(nn.ConvTranspose2d(128, 256, 1, 1, 0),nn.BatchNorm2d(256))
+
+        # 拼接后进行两个1*1卷积输出最终结果
+        self.score_head = Conv2d(768, cfg.anchors_per_position, 1, 1, 0, activation=False, batch_norm=False)  # (N, 6*D*C, H/2, H/2)->(N, anchors_per_position, H/2, H/2)
+        self.reg_head = Conv2d(768, 7 * cfg.anchors_per_position, 1, 1, 0, activation=False, batch_norm=False)  # (N, 6*D*C, H/2, H/2)->(N, 7*anchors_per_position, H/2, H/2)
+
+    def forward(self,x):
+        x = self.block_1(x)
+        x_skip_1 = x
+        x = self.block_2(x)
+        x_skip_2 = x
+        x = self.block_3(x)
+        x_0 = self.deconv_1(x)
+        x_1 = self.deconv_2(x_skip_2)
+        x_2 = self.deconv_3(x_skip_1)
+        x = torch.cat((x_0,x_1,x_2),1)  # (N, 6*D*C, H/2, H/2)
+        return self.score_head(x),self.reg_head(x)
+```
+
+### 损失求解
+
+```python
+class VoxelLoss(nn.Module):
+    def __init__(self, alpha, beta):
+        super(VoxelLoss, self).__init__()
+        self.smoothl1loss = nn.SmoothL1Loss(size_average=False)
+        self.alpha = alpha
+        self.beta = beta
+
+    # regression map(rm), score map(p?sm)
+    def forward(self, rm, psm, pos_equal_one, neg_equal_one, targets):
+
+        p_pos = F.sigmoid(psm.permute(0,2,3,1))
+        rm = rm.permute(0,2,3,1).contiguous()
+        rm = rm.view(rm.size(0),rm.size(1),rm.size(2),-1,7)
+        targets = targets.view(targets.size(0),targets.size(1),targets.size(2),-1,7)
+        pos_equal_one_for_reg = pos_equal_one.unsqueeze(pos_equal_one.dim()).expand(-1,-1,-1,-1,7)
+
+        rm_pos = rm * pos_equal_one_for_reg
+        targets_pos = targets * pos_equal_one_for_reg
+
+        cls_pos_loss = -pos_equal_one * torch.log(p_pos + 1e-6)
+        cls_pos_loss = cls_pos_loss.sum() / (pos_equal_one.sum() + 1e-6)
+
+        cls_neg_loss = -neg_equal_one * torch.log(1 - p_pos + 1e-6)
+        cls_neg_loss = cls_neg_loss.sum() / (neg_equal_one.sum() + 1e-6)
+
+        reg_loss = self.smoothl1loss(rm_pos, targets_pos)
+        reg_loss = reg_loss / (pos_equal_one.sum() + 1e-6)
+        conf_loss = self.alpha * cls_pos_loss + self.beta * cls_neg_loss
+        return conf_loss, reg_loss
+```
